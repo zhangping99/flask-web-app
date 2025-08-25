@@ -1,6 +1,6 @@
 name: Deploy Flask App to Touge Server
 
-# 触发条件：当代码推送到main分支时执行
+# 触发条件：代码推送到main分支时自动执行
 on:
   push:
     branches:
@@ -8,72 +8,89 @@ on:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest  # 使用GitHub提供的Ubuntu环境
+    runs-on: ubuntu-latest  # 使用GitHub托管的Ubuntu环境
+    timeout-minutes: 10     # 超时时间（避免流程无限挂起）
 
     steps:
-      # 步骤1：拉取GitHub仓库代码
-      - name: Checkout code
+      # 步骤1：拉取GitHub仓库最新代码
+      - name: Checkout repository code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1  # 仅拉取最新一次提交，加速流程
 
-      # 步骤2：配置Python环境（用于本地测试，与服务器版本一致）
-      - name: Set up Python
+      # 步骤2：配置Python环境（与头歌服务器Python版本匹配）
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'  # 确保与头歌服务器Python版本匹配
-          cache: 'pip'  # 缓存依赖，加速后续构建
+          python-version: '3.11'  # 必须与头歌服务器Python版本一致
+          cache: 'pip'           # 缓存pip依赖，减少重复安装时间
+          cache-dependency-path: requirements.txt  # 指定依赖文件路径
 
-      # 步骤3：安装依赖并运行测试（确保代码可正常工作）
+      # 步骤3：安装依赖并执行测试（修复Werkzeug版本兼容问题）
       - name: Install dependencies and run tests
         run: |
+          echo "🔄 更新pip版本"
           python -m pip install --upgrade pip
+          
+          echo "📦 安装项目依赖（锁定Werkzeug=3.0.6兼容测试）"
           pip install -r requirements.txt
-          pip install pytest  # 安装测试工具
-          echo "开始执行测试用例..."
-          pytest -v  # 加-v显示详细测试日志，便于定位用例失败原因
-        continue-on-error: false  # 测试失败时中断流程（如需跳过测试可改为true）
+          
+          echo "🧪 安装测试工具并执行测试"
+          pip install pytest==8.4.1  # 锁定pytest版本，避免兼容性问题
+          pytest tests/ -v  # -v显示详细测试日志，便于排查问题
+        continue-on-error: false  # 测试失败时中断部署（如需跳过可改为true）
 
-      # 步骤4：通过SSH连接头歌服务器（指定端口50241），部署最新代码
+      # 步骤4：SSH连接头歌服务器（修复私钥加载+指定50241端口）
       - name: Deploy to Touge Server via SSH (Port 50241)
         run: |
-          # 1. 配置SSH环境（关键：处理私钥权限和主机密钥）
+          # 1. 配置SSH环境：用cat+HereDoc保留私钥完整格式（避免echo丢失换行）
+          echo "🔧 配置SSH环境"
           mkdir -p ~/.ssh
-          # 写入私钥并设置严格权限（SSH强制要求600，否则拒绝使用）
-          echo "${{ secrets.TOUGE_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          
+          # 核心修复：用HereDoc写入私钥，确保格式不损坏（解决libcrypto加载错误）
+          cat > ~/.ssh/id_rsa << 'EOF'
+          ${{ secrets.TOUGE_SSH_PRIVATE_KEY }}
+          EOF
+          
+          # 强制设置私钥权限（SSH协议强制要求600，否则拒绝使用）
           chmod 600 ~/.ssh/id_rsa
-          # 扫描头歌服务器的SSH主机密钥（必须指定端口50241，否则默认扫22端口失败）
+          
+          # 扫描头歌服务器主机密钥（指定50241端口，避免默认22端口失败）
           ssh-keyscan -p 50241 -H ${{ secrets.TOUGE_SERVER_IP }} >> ~/.ssh/known_hosts
-          echo "SSH环境配置完成，开始尝试连接服务器（IP: ${{ secrets.TOUGE_SERVER_IP }}, 端口: 50241）"
+          echo "✅ SSH环境配置完成，开始连接服务器（IP: ${{ secrets.TOUGE_SERVER_IP }}, 端口: 50241）"
 
-          # 2. 通过SSH执行部署命令（-v显示详细连接日志，便于调试）
+          # 2. SSH连接服务器并执行部署命令（-v显示详细日志，便于调试）
           ssh -v -p 50241 root@${{ secrets.TOUGE_SERVER_IP }} << 'EOF'
-            # 开启服务器端命令错误捕获（任何命令失败则退出）
+            # 服务器端开启错误捕获：任何命令失败立即退出
             set -e
-            echo "✅ 成功连接到头歌服务器，当前用户：$(whoami)，当前目录：$(pwd)"
-
+            
+            # 验证连接成功
+            echo "🎉 成功连接到头歌服务器！当前用户：$(whoami)，当前目录：$(pwd)"
+            
             # 进入项目目录（不存在则报错）
-            echo "🔍 进入项目目录 /root/flask-web-app"
-            cd /root/flask-web-app || { echo "❌ 进入项目目录失败！目录不存在"; exit 1; }
-
-            # 拉取最新代码（处理Git可能的冲突或权限问题）
+            echo "📂 进入项目目录 /root/flask-web-app"
+            cd /root/flask-web-app || { echo "❌ 项目目录不存在！请先手动克隆代码"; exit 1; }
+            
+            # 拉取最新代码（处理Git可能的冲突）
             echo "📥 拉取GitHub main分支最新代码"
-            git pull origin main || { echo "❌ Git拉取失败！请检查仓库权限或网络"; exit 1; }
-
-            # 更新项目依赖（使用pip3确保与服务器Python3匹配）
-            echo "📦 安装/更新项目依赖"
+            git pull origin main || { echo "❌ Git拉取失败！检查仓库权限或网络"; exit 1; }
+            
+            # 安装/更新依赖（用pip3确保对应Python3）
+            echo "📦 安装项目依赖（根据requirements.txt）"
             pip3 install --upgrade pip
-            pip3 install -r requirements.txt || { echo "❌ 依赖安装失败！请检查requirements.txt"; exit 1; }
-
-            # 重启Supervisor管理的应用
+            pip3 install -r requirements.txt || { echo "❌ 依赖安装失败！检查requirements.txt"; exit 1; }
+            
+            # 重启Supervisor管理的Flask应用
             echo "🔄 重启Flask应用（supervisor管理）"
-            supervisorctl restart flask-web-app || { echo "❌ 应用重启失败！请检查supervisor配置"; exit 1; }
-
+            supervisorctl restart flask-web-app || { echo "❌ 应用重启失败！检查supervisor配置"; exit 1; }
+            
             # 输出最终应用状态（确认是否运行）
-            echo "📊 应用当前状态："
+            echo "📊 应用当前运行状态："
             supervisorctl status flask-web-app
-
-            echo "🎉 部署流程全部执行完毕！"
+            
+            echo "🎯 部署流程全部执行完毕！"
           EOF
         env:
-          # 从GitHub Secrets中获取敏感信息（需提前配置）
+          # 从GitHub Secrets读取敏感信息（需提前配置）
           TOUGE_SSH_PRIVATE_KEY: ${{ secrets.TOUGE_SSH_PRIVATE_KEY }}
           TOUGE_SERVER_IP: ${{ secrets.TOUGE_SERVER_IP }}
